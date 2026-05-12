@@ -1,0 +1,7 @@
+.env 
+groc.db 
+__pycache__/ 
+*.pyc 
+data/ 
+reports/ 
+outreach/

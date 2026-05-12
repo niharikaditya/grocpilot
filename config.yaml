@@ -1,0 +1,8 @@
+city:     pnw
+industry: indian_grocery
+
+# How many Google Places reviews to pull per business (Stage A)
+reviews_per_biz: 5
+
+# Not used for this pilot (no automated refresh)
+refresh_days: 30

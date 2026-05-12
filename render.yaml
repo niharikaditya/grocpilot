@@ -1,0 +1,30 @@
+services:
+  # ── Webhook + report server ─────────────────────────────────────────────
+  - type: web
+    name: grocpilot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn webhook_server:app
+    envVars:
+      - key: WEBHOOK_BASE_URL
+        value: https://grocpilot.onrender.com
+      - key: DB_PATH
+        value: groc.db
+      - key: REPORTS_DIR
+        value: reports
+      - key: SUPABASE_URL
+        sync: false          # set manually in Render dashboard — same value as vetpipeline
+      - key: SUPABASE_SERVICE_KEY
+        sync: false          # set manually in Render dashboard — same value as vetpipeline
+
+  # ── Health ping — every 10 minutes ─────────────────────────────────────
+  # Keeps the server awake so the first open/click after inactivity is fast
+  - type: cron
+    name: grocpilot-ping
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    schedule: "*/10 * * * *"
+    startCommand: python -c "import requests,os; requests.get(os.getenv('WEBHOOK_BASE_URL','https://grocpilot.onrender.com'),timeout=10)"
+    envVars:
+      - key: WEBHOOK_BASE_URL
+        value: https://grocpilot.onrender.com
