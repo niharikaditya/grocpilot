@@ -41,16 +41,33 @@ def safe_name(s: str) -> str:
 
 
 def load_analyse_output(place_id: str) -> dict:
-    """Load Claude's analysis output for this store."""
+    """Load analysis/config output for this store from pnw_configs.json."""
+    slug = cfg.city
+    configs_path = f"{slug}_configs.json"
+    if os.path.exists(configs_path):
+        try:
+            configs = json.load(open(configs_path))
+            c = configs.get(place_id, {})
+            if c:
+                # Map config fields to expected analysis keys
+                return {
+                    "key_finding":    c.get("lead_finding", ""),
+                    "risk_flag":      c.get("alertHeadline", ""),
+                    "strength":       c.get("strengthHeadline", ""),
+                    "alert":          c.get("alertHeadline", ""),
+                    "dimension_scores": c.get("dimension_scores", {}),
+                    "tone_profile":   c.get("tone_profile", "collegial"),
+                }
+        except Exception:
+            pass
+    # Fallback: original paths
     for pattern in [
         paths.data_file(f"{place_id}_analysis.json"),
         paths.data_file("analysis.json"),
-        f"data/{cfg.city}/{cfg.industry}/latest/analysis.json",
     ]:
         if os.path.exists(pattern):
             try:
                 data = json.load(open(pattern))
-                # Some analysis files are keyed by place_id
                 if place_id in data:
                     return data[place_id]
                 return data
@@ -60,44 +77,72 @@ def load_analyse_output(place_id: str) -> dict:
 
 
 def load_stats(place_id: str) -> dict:
-    """Load stats_lite output for this store."""
-    stats_path = paths.data_file("stats_lite.json")
-    if not os.path.exists(stats_path):
-        stats_path = paths.data_file("stats.json")
-    if os.path.exists(stats_path):
-        try:
-            raw = json.load(open(stats_path))
-            return raw.get("businesses", raw).get(place_id, {})
-        except Exception:
-            pass
+    """Load stats for this store from pnw_stats.json."""
+    slug = cfg.city
+    for stats_path in [f"{slug}_stats.json", paths.data_file("stats_lite.json"), paths.data_file("stats.json")]:
+        if os.path.exists(stats_path):
+            try:
+                raw = json.load(open(stats_path))
+                s = raw.get("businesses", raw).get(place_id, {})
+                if s:
+                    # Normalise field names
+                    if "negative_rate" in s and "neg_rate" not in s:
+                        s["neg_rate"] = s["negative_rate"]
+                    if "marketing" in s:
+                        mkt = s["marketing"]
+                        if "avg_monthly_reviews" not in s:
+                            s["avg_monthly_reviews"] = mkt.get("avg_monthly_reviews", 0)
+                    if "cluster_benchmarks" in s:
+                        cb = s["cluster_benchmarks"]
+                        s["cluster_name"] = s.get("cluster_name", "your area")
+                        s["cluster_avg_monthly_reviews"] = cb.get("avg_monthly_reviews", 0)
+                    return s
+            except Exception:
+                pass
     return {}
 
 
 def load_tier_a_b_stores() -> list:
-    """Return all TIER_A and TIER_B stores from ownership scorer output."""
+    """Return stores that have a confirmed email in groc_contacts.csv."""
+    import csv as _csv
+
+    # Load all final stores
+    final_list = json.load(open("groc_pilot_final_list.json")) if os.path.exists("groc_pilot_final_list.json") else []
+    final_by_pid = {s["place_id"]: s for s in final_list}
+
+    # Load confirmed emails from groc_contacts.csv
+    confirmed = {}
+    contacts_path = "groc_contacts.csv"
+    if os.path.exists(contacts_path):
+        with open(contacts_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                if row.get("Email") and row.get("Place ID"):
+                    confirmed[row["Place ID"]] = row["Email"]
+
     stores = []
-    slug   = cfg.city
-    for tier in ("tier_a", "tier_b"):
-        path = f"{slug}_{tier}.json"
-        if os.path.exists(path):
-            try:
-                stores.extend(json.load(open(path)))
-            except Exception:
-                pass
+    for pid, email in confirmed.items():
+        store = final_by_pid.get(pid, {"place_id": pid, "name": pid})
+        store = dict(store)  # copy
+        store["_contact_email"] = email
+        stores.append(store)
+
     return stores
 
 
-def get_store_email(place_id: str) -> str:
-    """Look up contact email from groc.db tracking table (added manually)."""
-    try:
-        conn  = sqlite3.connect(DB_PATH)
-        row   = conn.execute(
-            "SELECT email FROM groc_tokens WHERE place_id = ?", (place_id,)
-        ).fetchone()
-        conn.close()
-        return row[0] if row else ""
-    except Exception:
-        return ""
+def get_store_email(place_id: str, store: dict = None) -> str:
+    """Look up contact email — first from store dict, then from groc_contacts.csv."""
+    # Fastest: already embedded in store dict by load_tier_a_b_stores()
+    if store and store.get("_contact_email"):
+        return store["_contact_email"]
+    # Fallback: scan CSV
+    import csv as _csv
+    contacts_path = "groc_contacts.csv"
+    if os.path.exists(contacts_path):
+        with open(contacts_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                if row.get("Place ID") == place_id and row.get("Email"):
+                    return row["Email"]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -124,12 +169,20 @@ def generate_email(store_name: str, place_id: str,
     key_finding = analysis.get("key_finding", "")
     risk_flag   = analysis.get("risk_flag", "")
 
+    # Grocery revenue-at-risk estimate
+    _BASKET, _ICEBERG = 50, 10
+    _neg_rev_mo   = round(monthly_rev * (neg_rate / 100), 1) if monthly_rev and neg_rate else 0
+    _at_risk_mo   = int(_neg_rev_mo * _ICEBERG * _BASKET)
+    _at_risk_yr   = _at_risk_mo * 12
+
     # Build a context block for Claude
     signal_context = f"""Store: {store_name}
 Area: {cluster_name}
 Google rating: {rating} stars ({review_count} reviews)
 Monthly review pace: {monthly_rev}/mo (area avg: {cluster_avg}/mo)
 Negative review rate: {neg_rate}%
+Estimated revenue at risk: ${_at_risk_yr:,}/year (${_at_risk_mo:,}/month)
+  (based on {_neg_rev_mo} neg reviews/mo × 10 silent customers × $50 basket)
 Top positive theme: {top_positive or 'not identified'}
 Top concern in reviews: {top_theme or 'not identified'}
 Key analyst finding: {key_finding or 'not available'}
@@ -468,7 +521,7 @@ def generate_for_store(place_id: str, store: dict):
         return None
 
     # Create or retrieve tracking token
-    contact_email = get_store_email(place_id)
+    contact_email = get_store_email(place_id, store)
     from tracking import create_token, get_pixel_url, get_report_url
 
     # Determine report filename
