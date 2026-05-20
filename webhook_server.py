@@ -304,6 +304,57 @@ def events():
 
 
 # ---------------------------------------------------------------------------
+# Token creation  POST /tokens/create
+# Called once per business to generate a unique tracked report URL.
+# Stores token in groc_tokens table and returns the full URL.
+# ---------------------------------------------------------------------------
+
+@app.route("/tokens/create", methods=["POST"])
+def create_token():
+    data         = request.get_json(force=True) or {}
+    place_id     = data.get("place_id", "").strip()
+    email        = data.get("email", "").strip()
+    business_name = data.get("business_name", "").strip()
+    city         = data.get("city", "").strip()
+    report_type  = data.get("report_type", "stage2_personalised").strip()
+
+    if not place_id or not email:
+        return jsonify({"error": "place_id and email are required"}), 400
+
+    import secrets, sqlite3
+    token = secrets.token_urlsafe(24)
+    url   = f"{BASE_URL}/report/{token}"
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS groc_tokens (
+                token           TEXT PRIMARY KEY,
+                place_id        TEXT,
+                email           TEXT,
+                store_name      TEXT,
+                city            TEXT,
+                report_type     TEXT,
+                report_filename TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            INSERT OR REPLACE INTO groc_tokens
+                (token, place_id, email, store_name, city, report_type)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (token, place_id, email, business_name, city, report_type))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[TOKENS/CREATE] DB error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+    print(f"[TOKENS/CREATE] {business_name} -> {token[:12]}...")
+    return jsonify({"token": token, "url": url}), 200
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
