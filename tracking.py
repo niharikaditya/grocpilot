@@ -1,17 +1,14 @@
 """
-tracking.py — Token generation and management for groc pilot.
+tracking.py — Token generation and event logging for groc pilot.
 
-Each store gets one UUID token that ties together:
-  - The tracking pixel (email open)
-  - The report link (click)
-  - The Supabase groc_tokens record
+Storage strategy:
+  PRIMARY:  Supabase (groc_tokens, groc_tracking tables)
+            — used on Render and anywhere SUPABASE_URL is set
+  FALLBACK: SQLite (groc.db)
+            — used for local dev only when Supabase creds are absent
 
-Usage:
-    from tracking import create_token, get_pixel_url, get_report_url
-
-    token = create_token(place_id, store_name, email, report_filename)
-    pixel = get_pixel_url(token)   # embed in email HTML as 1x1 <img>
-    link  = get_report_url(token)  # use as report CTA link in email
+This means tokens survive Render redeploys, cross-machine usage,
+and are accessible from both the local scripts and the live server.
 """
 
 import os
@@ -23,19 +20,44 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL   = os.getenv("WEBHOOK_BASE_URL", "https://grocpilot.onrender.com")
-DB_PATH    = os.getenv("DB_PATH", "groc.db")
-
+BASE_URL     = os.getenv("WEBHOOK_BASE_URL", "https://grocpilot.onrender.com")
+DB_PATH      = os.getenv("DB_PATH", "groc.db")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 
 # ---------------------------------------------------------------------------
-# SQLite setup — local backup, also used when Supabase is unavailable
+# Supabase client (singleton)
 # ---------------------------------------------------------------------------
 
-def _init_db(db_path=DB_PATH):
-    conn = sqlite3.connect(db_path)
+_sb_client = None
+
+def _sb():
+    """Return Supabase client, or None if creds are missing."""
+    global _sb_client
+    if _sb_client is not None:
+        return _sb_client
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        from supabase import create_client
+        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        return _sb_client
+    except Exception as e:
+        print(f"[TRACKING] Supabase init failed: {e}")
+        return None
+
+
+def _using_supabase() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+# ---------------------------------------------------------------------------
+# SQLite fallback — only initialised when Supabase is unavailable
+# ---------------------------------------------------------------------------
+
+def _init_db():
+    conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS groc_tokens (
             token           TEXT PRIMARY KEY,
@@ -62,63 +84,56 @@ def _init_db(db_path=DB_PATH):
 
 
 # ---------------------------------------------------------------------------
-# Supabase helpers (same creds as vetpipeline, groc_ table prefix)
-# ---------------------------------------------------------------------------
-
-def _get_supabase():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    try:
-        from supabase import create_client
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
-        return None
-
-
-def _supabase_upsert_token(record: dict):
-    sb = _get_supabase()
-    if not sb:
-        return
-    try:
-        sb.table("groc_tokens").upsert(record).execute()
-    except Exception as e:
-        print(f"[TRACKING] Supabase token upsert failed: {e}")
-
-
-def _supabase_log_event(record: dict):
-    sb = _get_supabase()
-    if not sb:
-        return
-    try:
-        sb.table("groc_tracking").insert(record).execute()
-    except Exception as e:
-        print(f"[TRACKING] Supabase event insert failed: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def create_token(place_id: str, store_name: str,
                  email: str = "", report_filename: str = "") -> str:
     """
-    Generate a unique token for this store, persist to SQLite + Supabase.
-    Idempotent — if a token already exists for this place_id, return it.
+    Generate a unique token for this store.
+    Idempotent — returns existing token if place_id already has one.
+    Writes to Supabase (primary) and SQLite (fallback/backup).
     """
+    now   = datetime.now(timezone.utc).isoformat()
+
+    # ── Supabase path ───────────────────────────────────────────
+    sb = _sb()
+    if sb:
+        try:
+            # Check for existing token
+            existing = sb.table("groc_tokens") \
+                         .select("token") \
+                         .eq("place_id", place_id) \
+                         .execute()
+            if existing.data:
+                return existing.data[0]["token"]
+
+            token  = secrets.token_urlsafe(16)
+            record = {
+                "token":           token,
+                "place_id":        place_id,
+                "store_name":      store_name,
+                "email":           email,
+                "report_filename": report_filename,
+                "created_at":      now,
+            }
+            sb.table("groc_tokens").insert(record).execute()
+            print(f"[TRACKING] Token created (Supabase) for {store_name}: {token}")
+            return token
+        except Exception as e:
+            print(f"[TRACKING] Supabase create_token error: {e} — falling back to SQLite")
+
+    # ── SQLite fallback ─────────────────────────────────────────
     _init_db()
     conn = sqlite3.connect(DB_PATH)
-
-    # Return existing token if already created for this place_id
-    row = conn.execute(
+    row  = conn.execute(
         "SELECT token FROM groc_tokens WHERE place_id = ?", (place_id,)
     ).fetchone()
     if row:
         conn.close()
         return row[0]
 
-    token = secrets.token_urlsafe(16)
-    now   = datetime.now(timezone.utc).isoformat()
-
+    token  = secrets.token_urlsafe(16)
     record = {
         "token":           token,
         "place_id":        place_id,
@@ -127,7 +142,6 @@ def create_token(place_id: str, store_name: str,
         "report_filename": report_filename,
         "created_at":      now,
     }
-
     conn.execute("""
         INSERT OR IGNORE INTO groc_tokens
             (token, place_id, store_name, email, report_filename, created_at)
@@ -135,93 +149,187 @@ def create_token(place_id: str, store_name: str,
     """, record)
     conn.commit()
     conn.close()
-
-    _supabase_upsert_token(record)
-    print(f"[TRACKING] Token created for {store_name}: {token}")
+    print(f"[TRACKING] Token created (SQLite) for {store_name}: {token}")
     return token
 
 
 def get_token(place_id: str) -> str:
-    """Return the token for a place_id, or empty string if not found."""
-    _init_db()
-    conn = sqlite3.connect(DB_PATH)
-    row  = conn.execute(
-        "SELECT token FROM groc_tokens WHERE place_id = ?", (place_id,)
-    ).fetchone()
-    conn.close()
-    return row[0] if row else ""
+    """Return the token for a place_id. Reads Supabase first, SQLite fallback."""
+    sb = _sb()
+    if sb:
+        try:
+            result = sb.table("groc_tokens") \
+                       .select("token") \
+                       .eq("place_id", place_id) \
+                       .execute()
+            if result.data:
+                return result.data[0]["token"]
+        except Exception as e:
+            print(f"[TRACKING] Supabase get_token error: {e}")
+
+    # SQLite fallback
+    try:
+        _init_db()
+        conn = sqlite3.connect(DB_PATH)
+        row  = conn.execute(
+            "SELECT token FROM groc_tokens WHERE place_id = ?", (place_id,)
+        ).fetchone()
+        conn.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+
+def resolve_token(token: str) -> dict:
+    """
+    Look up a token and return its record dict.
+    Returns {} if not found.
+    Reads Supabase first, SQLite fallback.
+    """
+    sb = _sb()
+    if sb:
+        try:
+            result = sb.table("groc_tokens") \
+                       .select("*") \
+                       .eq("token", token) \
+                       .execute()
+            if result.data:
+                return result.data[0]
+        except Exception as e:
+            print(f"[TRACKING] Supabase resolve_token error: {e}")
+
+    # SQLite fallback
+    try:
+        _init_db()
+        conn = sqlite3.connect(DB_PATH)
+        row  = conn.execute(
+            "SELECT token, place_id, store_name, email, report_filename "
+            "FROM groc_tokens WHERE token = ?", (token,)
+        ).fetchone()
+        conn.close()
+        if row:
+            return {
+                "token":           row[0],
+                "place_id":        row[1],
+                "store_name":      row[2],
+                "email":           row[3],
+                "report_filename": row[4],
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def update_report_filename(token: str, report_filename: str):
+    """Update the report_filename for an existing token."""
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("groc_tokens") \
+              .update({"report_filename": report_filename}) \
+              .eq("token", token) \
+              .execute()
+            return
+        except Exception as e:
+            print(f"[TRACKING] Supabase update_report_filename error: {e}")
+
+    try:
+        _init_db()
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE groc_tokens SET report_filename = ? WHERE token = ?",
+            (report_filename, token)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[TRACKING] SQLite update_report_filename error: {e}")
 
 
 def get_pixel_url(token: str) -> str:
-    """Returns the tracking pixel URL to embed in the email as a 1x1 <img>."""
     return f"{BASE_URL}/pixel/{token}"
 
 
 def get_report_url(token: str) -> str:
-    """Returns the tracked report link to use as the CTA in the email."""
     return f"{BASE_URL}/report/{token}"
 
 
 def log_event(token: str, event_type: str, ip: str = ""):
-    """Log an open or click event to SQLite + Supabase."""
-    _init_db()
-    conn = sqlite3.connect(DB_PATH)
-    row  = conn.execute(
-        "SELECT place_id, store_name FROM groc_tokens WHERE token = ?", (token,)
-    ).fetchone()
+    """Log an open/click/unsubscribe event. Writes Supabase first, SQLite backup."""
+    record_info = resolve_token(token)
+    place_id    = record_info.get("place_id", "")
+    store_name  = record_info.get("store_name", "")
+    now         = datetime.now(timezone.utc).isoformat()
 
-    place_id   = row[0] if row else ""
-    store_name = row[1] if row else ""
-    now        = datetime.now(timezone.utc).isoformat()
-
-    conn.execute("""
-        INSERT INTO groc_tracking (token, place_id, store_name, event_type, occurred_at, ip)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (token, place_id, store_name, event_type, now, ip))
-    conn.commit()
-    conn.close()
-
-    _supabase_log_event({
+    event = {
         "token":       token,
         "place_id":    place_id,
         "store_name":  store_name,
         "event_type":  event_type,
         "occurred_at": now,
         "ip":          ip,
-    })
-    print(f"[TRACKING] {event_type} | {store_name or token}")
+    }
+
+    # Supabase
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("groc_tracking").insert(event).execute()
+            print(f"[TRACKING] {event_type} | {store_name or token}")
+            return
+        except Exception as e:
+            print(f"[TRACKING] Supabase log_event error: {e}")
+
+    # SQLite fallback
+    try:
+        _init_db()
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            INSERT INTO groc_tracking
+                (token, place_id, store_name, event_type, occurred_at, ip)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (token, place_id, store_name, event_type, now, ip))
+        conn.commit()
+        conn.close()
+        print(f"[TRACKING] {event_type} | {store_name or token}")
+    except Exception as e:
+        print(f"[TRACKING] SQLite log_event error: {e}")
 
 
 # ---------------------------------------------------------------------------
-# CLI — print current tracking table
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _init_db()
-    conn = sqlite3.connect(DB_PATH)
+    sb = _sb()
+    if sb:
+        print(f"\nReading from Supabase...\n")
+        tokens = sb.table("groc_tokens").select("*").order("created_at").execute().data
+        events = sb.table("groc_tracking").select("*").order("occurred_at", desc=True).limit(50).execute().data
+    else:
+        print(f"\nSupabase not configured — reading from SQLite...\n")
+        _init_db()
+        conn   = sqlite3.connect(DB_PATH)
+        tokens = [dict(zip(["store_name","place_id","token","created_at"], r))
+                  for r in conn.execute(
+                      "SELECT store_name, place_id, token, created_at FROM groc_tokens ORDER BY created_at"
+                  ).fetchall()]
+        events = [dict(zip(["store_name","event_type","occurred_at"], r))
+                  for r in conn.execute(
+                      "SELECT store_name, event_type, occurred_at FROM groc_tracking ORDER BY occurred_at DESC LIMIT 50"
+                  ).fetchall()]
+        conn.close()
 
-    tokens = conn.execute(
-        "SELECT store_name, place_id, token, created_at FROM groc_tokens ORDER BY created_at"
-    ).fetchall()
-
-    events = conn.execute("""
-        SELECT store_name, event_type, occurred_at
-        FROM groc_tracking
-        ORDER BY occurred_at DESC
-        LIMIT 50
-    """).fetchall()
-    conn.close()
-
-    print(f"\n{'='*60}")
-    print(f"  GROC PILOT TOKENS ({len(tokens)} stores)")
     print(f"{'='*60}")
-    for store_name, place_id, token, created_at in tokens:
-        print(f"  {store_name:<35} {token}")
+    print(f"  TOKENS ({len(tokens)} stores)")
+    print(f"{'='*60}")
+    for t in tokens:
+        print(f"  {t.get('store_name',''):<35} {t.get('token','')}")
 
     print(f"\n{'='*60}")
     print(f"  RECENT EVENTS ({len(events)})")
     print(f"{'='*60}")
-    for store_name, event_type, occurred_at in events:
-        ts = occurred_at[:16].replace("T", " ") if occurred_at else ""
-        print(f"  {ts}  {event_type:<20}  {store_name}")
+    for e in events:
+        ts = (e.get("occurred_at","") or "")[:16].replace("T"," ")
+        print(f"  {ts}  {e.get('event_type',''):<20}  {e.get('store_name','')}")
     print()
