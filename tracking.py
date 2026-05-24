@@ -14,6 +14,7 @@ and are accessible from both the local scripts and the live server.
 import os
 import secrets
 import sqlite3
+import requests
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -27,29 +28,60 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 
 # ---------------------------------------------------------------------------
-# Supabase client (singleton)
+# Supabase REST API helpers — uses requests only, no supabase package
 # ---------------------------------------------------------------------------
-
-_sb_client = None
-
-def _sb():
-    """Return Supabase client, or None if creds are missing."""
-    global _sb_client
-    if _sb_client is not None:
-        return _sb_client
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-    try:
-        from supabase import create_client
-        _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        return _sb_client
-    except Exception as e:
-        print(f"[TRACKING] Supabase init failed: {e}")
-        return None
-
 
 def _using_supabase() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
+
+def _sb_headers() -> dict:
+    return {
+        "apikey":        SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type":  "application/json",
+        "Prefer":        "return=representation",
+    }
+
+def _sb_get(table: str, filters: dict) -> list:
+    """GET rows from Supabase table matching filters."""
+    import requests as _req
+    params = {f"{k}": f"eq.{v}" for k, v in filters.items()}
+    try:
+        r = _req.get(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(), params=params, timeout=8
+        )
+        return r.json() if r.status_code == 200 else []
+    except Exception as e:
+        print(f"[TRACKING] Supabase GET error: {e}")
+        return []
+
+def _sb_insert(table: str, record: dict) -> bool:
+    """INSERT a row into Supabase table."""
+    import requests as _req
+    try:
+        r = _req.post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(), json=record, timeout=8
+        )
+        return r.status_code in (200, 201)
+    except Exception as e:
+        print(f"[TRACKING] Supabase INSERT error: {e}")
+        return False
+
+def _sb_patch(table: str, filters: dict, data: dict) -> bool:
+    """PATCH rows in Supabase table matching filters."""
+    import requests as _req
+    params = {f"{k}": f"eq.{v}" for k, v in filters.items()}
+    try:
+        r = _req.patch(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers=_sb_headers(), params=params, json=data, timeout=8
+        )
+        return r.status_code in (200, 204)
+    except Exception as e:
+        print(f"[TRACKING] Supabase PATCH error: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -97,31 +129,19 @@ def create_token(place_id: str, store_name: str,
     now   = datetime.now(timezone.utc).isoformat()
 
     # ── Supabase path ───────────────────────────────────────────
-    sb = _sb()
-    if sb:
-        try:
-            # Check for existing token
-            existing = sb.table("groc_tokens") \
-                         .select("token") \
-                         .eq("place_id", place_id) \
-                         .execute()
-            if existing.data:
-                return existing.data[0]["token"]
-
-            token  = secrets.token_urlsafe(16)
-            record = {
-                "token":           token,
-                "place_id":        place_id,
-                "store_name":      store_name,
-                "email":           email,
-                "report_filename": report_filename,
-                "created_at":      now,
-            }
-            sb.table("groc_tokens").insert(record).execute()
+    if _using_supabase():
+        existing = _sb_get("groc_tokens", {"place_id": place_id})
+        if existing:
+            return existing[0]["token"]
+        token  = secrets.token_urlsafe(16)
+        record = {
+            "token": token, "place_id": place_id, "store_name": store_name,
+            "email": email, "report_filename": report_filename, "created_at": now,
+        }
+        if _sb_insert("groc_tokens", record):
             print(f"[TRACKING] Token created (Supabase) for {store_name}: {token}")
             return token
-        except Exception as e:
-            print(f"[TRACKING] Supabase create_token error: {e} — falling back to SQLite")
+        print(f"[TRACKING] Supabase insert failed — falling back to SQLite")
 
     # ── SQLite fallback ─────────────────────────────────────────
     _init_db()
@@ -155,17 +175,10 @@ def create_token(place_id: str, store_name: str,
 
 def get_token(place_id: str) -> str:
     """Return the token for a place_id. Reads Supabase first, SQLite fallback."""
-    sb = _sb()
-    if sb:
-        try:
-            result = sb.table("groc_tokens") \
-                       .select("token") \
-                       .eq("place_id", place_id) \
-                       .execute()
-            if result.data:
-                return result.data[0]["token"]
-        except Exception as e:
-            print(f"[TRACKING] Supabase get_token error: {e}")
+    if _using_supabase():
+        rows = _sb_get("groc_tokens", {"place_id": place_id})
+        if rows:
+            return rows[0]["token"]
 
     # SQLite fallback
     try:
@@ -186,17 +199,10 @@ def resolve_token(token: str) -> dict:
     Returns {} if not found.
     Reads Supabase first, SQLite fallback.
     """
-    sb = _sb()
-    if sb:
-        try:
-            result = sb.table("groc_tokens") \
-                       .select("*") \
-                       .eq("token", token) \
-                       .execute()
-            if result.data:
-                return result.data[0]
-        except Exception as e:
-            print(f"[TRACKING] Supabase resolve_token error: {e}")
+    if _using_supabase():
+        rows = _sb_get("groc_tokens", {"token": token})
+        if rows:
+            return rows[0]
 
     # SQLite fallback
     try:
@@ -222,16 +228,9 @@ def resolve_token(token: str) -> dict:
 
 def update_report_filename(token: str, report_filename: str):
     """Update the report_filename for an existing token."""
-    sb = _sb()
-    if sb:
-        try:
-            sb.table("groc_tokens") \
-              .update({"report_filename": report_filename}) \
-              .eq("token", token) \
-              .execute()
+    if _using_supabase():
+        if _sb_patch("groc_tokens", {"token": token}, {"report_filename": report_filename}):
             return
-        except Exception as e:
-            print(f"[TRACKING] Supabase update_report_filename error: {e}")
 
     try:
         _init_db()
@@ -271,14 +270,10 @@ def log_event(token: str, event_type: str, ip: str = ""):
     }
 
     # Supabase
-    sb = _sb()
-    if sb:
-        try:
-            sb.table("groc_tracking").insert(event).execute()
+    if _using_supabase():
+        if _sb_insert("groc_tracking", event):
             print(f"[TRACKING] {event_type} | {store_name or token}")
             return
-        except Exception as e:
-            print(f"[TRACKING] Supabase log_event error: {e}")
 
     # SQLite fallback
     try:
@@ -301,11 +296,11 @@ def log_event(token: str, event_type: str, ip: str = ""):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    sb = _sb()
-    if sb:
+    if _using_supabase():
         print(f"\nReading from Supabase...\n")
-        tokens = sb.table("groc_tokens").select("*").order("created_at").execute().data
-        events = sb.table("groc_tracking").select("*").order("occurred_at", desc=True).limit(50).execute().data
+        import requests as _req
+        tokens = _req.get(f"{SUPABASE_URL}/rest/v1/groc_tokens?order=created_at", headers=_sb_headers()).json() or []
+        events = _req.get(f"{SUPABASE_URL}/rest/v1/groc_tracking?order=occurred_at.desc&limit=50", headers=_sb_headers()).json() or []
     else:
         print(f"\nSupabase not configured — reading from SQLite...\n")
         _init_db()
