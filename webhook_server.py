@@ -149,22 +149,16 @@ def unsubscribe():
     token = request.args.get("token", "").strip()
     if token:
         try:
-            from tracking import log_event, _sb
+            from tracking import log_event, resolve_token, _sb_insert, _using_supabase
             log_event(token, "unsubscribed")
-            # Also write to groc_unsubscribes for suppression list
-            sb = _sb()
-            if sb:
-                from tracking import resolve_token
+            if _using_supabase():
                 rec = resolve_token(token)
                 if rec.get("email"):
-                    try:
-                        sb.table("groc_unsubscribes").upsert({
-                            "email_address": rec["email"],
-                            "place_id":      rec.get("place_id", ""),
-                            "created_at":    datetime.now(timezone.utc).isoformat(),
-                        }).execute()
-                    except Exception:
-                        pass
+                    _sb_insert("groc_unsubscribes", {
+                        "email_address": rec["email"],
+                        "place_id":      rec.get("place_id", ""),
+                        "created_at":    datetime.now(timezone.utc).isoformat(),
+                    })
         except Exception as e:
             print(f"[UNSUBSCRIBE] {e}")
 
@@ -186,24 +180,22 @@ p{color:#6B6A64;line-height:1.6}</style></head>
 def events():
     rows = []
     try:
-        from tracking import _sb
-        sb = _sb()
-        if sb:
-            result = sb.table("groc_tracking") \
-                       .select("store_name, event_type, occurred_at, ip, token") \
-                       .order("occurred_at", desc=True) \
-                       .limit(200) \
-                       .execute()
-            # Enrich with email from tokens
-            token_emails = {}
-            try:
-                toks = sb.table("groc_tokens").select("token, email").execute()
-                token_emails = {t["token"]: t.get("email","") for t in toks.data}
-            except Exception:
-                pass
-            rows = [(r["store_name"], r["event_type"], r["occurred_at"],
-                     r.get("ip",""), token_emails.get(r["token"],""))
-                    for r in result.data]
+        from tracking import _using_supabase, _sb_get
+        if _using_supabase():
+            events_data = _sb_get("groc_tracking?order=occurred_at.desc&limit=200", {}) or []
+            # _sb_get doesn't support raw query strings — use requests directly
+            import requests as _req, os as _os
+            from tracking import SUPABASE_URL, SUPABASE_KEY, _sb_headers
+            ev_r = _req.get(f"{SUPABASE_URL}/rest/v1/groc_tracking?order=occurred_at.desc&limit=200",
+                            headers=_sb_headers())
+            tk_r = _req.get(f"{SUPABASE_URL}/rest/v1/groc_tokens?select=token,email",
+                            headers=_sb_headers())
+            ev_data = ev_r.json() if ev_r.status_code == 200 else []
+            tk_data = tk_r.json() if tk_r.status_code == 200 else []
+            token_emails = {t["token"]: t.get("email","") for t in tk_data}
+            rows = [(r.get("store_name",""), r.get("event_type",""), r.get("occurred_at",""),
+                     r.get("ip",""), token_emails.get(r.get("token",""),""))
+                    for r in ev_data]
         else:
             # SQLite fallback
             import sqlite3
